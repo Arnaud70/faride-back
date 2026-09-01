@@ -1,0 +1,212 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum Role {
+  CLIENT
+  CHEF
+  ADMIN
+  LIVREUR
+}
+
+enum OrderStatus {
+  EN_ATTENTE
+  EN_PREPARATION
+  PRETE
+  LIVREE
+  RECUPEREE
+  ANNULEE
+}
+
+enum PaymentStatus {
+  EN_ATTENTE
+  VALIDE
+  ECHOUE
+}
+
+enum PaymentMethod {
+  ESPECES
+  MOBILE_MONEY_SIMULE
+  CARTE_SIMULEE
+}
+
+enum OrderType {
+  A_EMPORTER
+  LIVRAISON
+  SUR_PLACE
+}
+
+enum NotificationType {
+  COMMANDE
+  PAIEMENT
+  RAPPEL
+  SYSTEME
+}
+
+// ============================================
+// MODELES
+// ============================================
+
+model User {
+  id            String    @id @default(uuid())
+  nom           String
+  telephone     String    @unique
+  email         String?   @unique
+  motDePasseHash String
+  role          Role      @default(CLIENT)
+  actif         Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  orders        Order[]
+  livreurOrders Order[] @relation("LivreurOrders")
+  refreshTokens RefreshToken[]
+  notifications Notification[]
+
+  @@index([email])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  tokenHash String
+  expiresAt DateTime
+  revoked   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@map("refresh_tokens")
+}
+
+model Category {
+  id          String   @id @default(uuid())
+  nom         String   @unique
+  description String?
+  imageUrl    String?
+  actif       Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt @default(now())
+
+  dishes      Dish[]
+
+  @@map("categories")
+}
+
+model Dish {
+  id           String   @id @default(uuid())
+  nom          String
+  description  String?
+  prix         Decimal  @db.Decimal(10, 2)
+  dureeCuissonMinutes Int @default(20)
+  disponible   Boolean  @default(true)
+  imageUrl     String?
+  categorie    Category @relation(fields: [categorieId], references: [id])
+  categorieId  String
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  orderItems   OrderItem[]
+
+  @@index([categorieId])
+  @@map("dishes")
+}
+
+model Order {
+  id            String      @id @default(uuid())
+  orderNumber   String      @unique
+  client        User        @relation(fields: [clientId], references: [id])
+  clientId      String
+  livreur       User?       @relation("LivreurOrders", fields: [livreurId], references: [id])
+  livreurId     String?
+  statut        OrderStatus @default(EN_ATTENTE)
+  orderType     OrderType   @default(A_EMPORTER)
+  heureRetrait  DateTime
+  montantTotal  Decimal     @db.Decimal(10, 2)
+  notes         String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  items         OrderItem[]
+  payment       Payment?
+  reminder      Reminder?
+
+  @@index([statut])
+  @@index([heureRetrait])
+  @@index([createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id            String   @id @default(uuid())
+  order         Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId       String
+  dish          Dish     @relation(fields: [dishId], references: [id])
+  dishId        String
+  quantite      Int
+  prixUnitaire  Decimal  @db.Decimal(10, 2)
+
+  @@map("order_items")
+}
+
+model Payment {
+  id        String        @id @default(uuid())
+  order     Order         @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId   String        @unique
+  methode   PaymentMethod
+  statut    PaymentStatus @default(EN_ATTENTE)
+  montant   Decimal       @db.Decimal(10, 2)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  @@map("payments")
+}
+
+model Reminder {
+  id                 String   @id @default(uuid())
+  order              Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderId            String   @unique
+  heureDeclenchement DateTime
+  envoye             Boolean  @default(false)
+  createdAt          DateTime @default(now())
+
+  @@map("reminders")
+}
+
+model RestaurantSetting {
+  id                      String   @id @default(uuid())
+  nomRestaurant           String   @default("Saveurs d'Ébène")
+  adresse                 String   @default("Agoè-Nyivé, Lomé - Togo")
+  telephone               String   @default("+228 00 00 00 00")
+  heureOuverture          String   @default("10:00")
+  heureFermeture          String   @default("22:00")
+  intervalleCreneauxMin   Int      @default(30)
+  bufferPreparationMin    Int      @default(15)
+  maxCommandesParCreneau  Int      @default(5)
+  updatedAt               DateTime @updatedAt @default(now())
+
+  @@map("restaurant_settings")
+}
+
+model Notification {
+  id        String           @id @default(uuid())
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  titre     String
+  message   String
+  type      NotificationType @default(SYSTEME)
+  lu        Boolean          @default(false)
+  createdAt DateTime         @default(now())
+
+  @@index([userId])
+  @@map("notifications")
+}

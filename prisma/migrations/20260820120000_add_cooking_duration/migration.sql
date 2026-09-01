@@ -1,0 +1,2 @@
+ALTER TABLE "dishes"
+ADD COLUMN "dureeCuissonMinutes" INTEGER NOT NULL DEFAULT 20;
