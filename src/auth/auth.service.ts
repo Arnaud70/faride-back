@@ -105,33 +105,31 @@ export class AuthService {
       throw new UnauthorizedException('Refresh token manquant');
     }
 
-    try {
-      const tokenHash = await bcrypt.hash(refreshToken, 10);
-      const candidates = await this.prisma.refreshToken.findMany({
-        where: { revoked: false, expiresAt: { gt: new Date() } },
-      });
-      const storedToken = await this.findMatchingToken(candidates, refreshToken, tokenHash);
+    const candidates = await this.prisma.refreshToken.findMany({
+      where: { revoked: false, expiresAt: { gt: new Date() } },
+    });
+    const storedToken = await this.findMatchingToken(candidates, refreshToken);
 
-      if (!storedToken) {
-        throw new UnauthorizedException('Refresh token invalide ou expiré');
-      }
-
-      const payload = this.jwtService.verify<{ sub: string }>(refreshToken);
-      const user = await this.validateUser(payload.sub);
-      await this.prisma.refreshToken.update({
-        where: { id: storedToken.id },
-        data: { revoked: true },
-      });
-      const tokens = await this.issueTokens(user.id, user.role);
-      return {
-        message: 'Token actualisé',
-        accessToken: tokens.accessToken,
-        refreshToken: tokens.refreshToken,
-        user: this.publicUser(user),
-      };
-    } catch {
+    if (!storedToken) {
       throw new UnauthorizedException('Refresh token invalide ou expiré');
     }
+
+    // Le refresh token est un jeton opaque : on récupère l'utilisateur via
+    // l'enregistrement en base, pas en le décodant comme un JWT.
+    const user = await this.validateUser(storedToken.userId);
+
+    // Rotation : on révoque l'ancien jeton et on en émet un nouveau.
+    await this.prisma.refreshToken.update({
+      where: { id: storedToken.id },
+      data: { revoked: true },
+    });
+    const tokens = await this.issueTokens(user.id, user.role);
+    return {
+      message: 'Token actualisé',
+      accessToken: tokens.accessToken,
+      refreshToken: tokens.refreshToken,
+      user: this.publicUser(user),
+    };
   }
 
   async logout(refreshToken: string) {
@@ -162,7 +160,10 @@ export class AuthService {
     return { accessToken, refreshToken };
   }
 
-  private async findMatchingToken(candidates: Array<{ id: string; tokenHash: string }>, token: string, _unusedHash?: string) {
+  private async findMatchingToken<T extends { tokenHash: string }>(
+    candidates: T[],
+    token: string,
+  ): Promise<T | null> {
     for (const candidate of candidates) {
       if (await bcrypt.compare(token, candidate.tokenHash)) return candidate;
     }
@@ -177,20 +178,6 @@ export class AuthService {
       email: user.email,
       role: user.role,
     };
-  }
-
-  private generateTokens(userId: string, userRole: string) {
-    const payload = { sub: userId, role: userRole };
-
-    const accessToken = this.jwtService.sign(payload, {
-      expiresIn: '15m',
-    });
-
-    const refreshToken = this.jwtService.sign(payload, {
-      expiresIn: '7d',
-    });
-
-    return { accessToken, refreshToken };
   }
 
   async validateUser(userId: string) {
