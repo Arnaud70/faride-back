@@ -8,12 +8,23 @@ import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 
 const TRANSIENT_CODES = ['P1001', 'P1002', 'P1008', 'P1017'];
-const TRANSIENT_HINTS = ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'Closed', 'terminated', 'not reachable'];
+const TRANSIENT_HINTS = [
+  'etimedout',
+  'econnreset',
+  'econnrefused',
+  'epipe',
+  'closed',
+  'terminated',
+  'not reachable',
+  'connection error',
+  'not queryable',
+  'server closed the connection',
+];
 
 const isTransient = (error: unknown): boolean => {
   const e = error as { code?: string; message?: string };
   if (e?.code && TRANSIENT_CODES.includes(e.code)) return true;
-  const msg = e?.message ?? '';
+  const msg = (e?.message ?? '').toLowerCase();
   return TRANSIENT_HINTS.some((h) => msg.includes(h));
 };
 

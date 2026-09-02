@@ -4,7 +4,12 @@ import { PrismaPg } from '@prisma/adapter-pg';
 import { Decimal } from 'decimal.js';
 import * as bcrypt from 'bcrypt';
 
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
+const adapter = new PrismaPg({
+  connectionString: process.env.DATABASE_URL,
+  keepAlive: true,
+  connectionTimeoutMillis: 20_000,
+  idleTimeoutMillis: 10_000,
+});
 const prisma = new PrismaClient({ adapter });
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -14,24 +19,36 @@ const isTransient = (error: any) => {
   const msg = String(error?.message ?? '');
   return (
     ['P1001', 'P1002', 'P1008', 'P1017'].includes(code) ||
-    ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'Closed', 'terminated', 'not reachable'].some((h) =>
-      msg.includes(h),
-    )
+    [
+      'ETIMEDOUT',
+      'ECONNRESET',
+      'ECONNREFUSED',
+      'EPIPE',
+      'Closed',
+      'terminated',
+      'not reachable',
+      'connection error',
+      'not queryable',
+      'Connection terminated',
+      'server closed the connection',
+    ].some((h) => msg.toLowerCase().includes(h.toLowerCase()))
   );
 };
 
 /**
  * Rejoue `fn` sur erreur transitoire. Le seed n'utilisant que des `upsert`
  * idempotents, on peut relancer tout le bloc sans risque de doublon.
+ * On coupe le pool entre deux essais pour repartir sur des connexions saines.
  */
-async function withRetry<T>(label: string, fn: () => Promise<T>, tries = 6): Promise<T> {
+async function withRetry<T>(label: string, fn: () => Promise<T>, tries = 8): Promise<T> {
   for (let i = 1; i <= tries; i++) {
     try {
       return await fn();
     } catch (error) {
       if (i === tries || !isTransient(error)) throw error;
       const delay = Math.min(2000 * i, 8000);
-      console.log(`⏳ ${label} : base endormie (${i}/${tries - 1}), nouvel essai dans ${delay} ms…`);
+      console.log(`⏳ ${label} : connexion instable (${i}/${tries - 1}), nouvel essai dans ${delay} ms…`);
+      await prisma.$disconnect().catch(() => undefined);
       await sleep(delay);
     }
   }
