@@ -7,15 +7,26 @@ import {
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 
+const TRANSIENT_CODES = ['P1001', 'P1002', 'P1008', 'P1017'];
+const TRANSIENT_HINTS = ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'Closed', 'terminated', 'not reachable'];
+
+const isTransient = (error: unknown): boolean => {
+  const e = error as { code?: string; message?: string };
+  if (e?.code && TRANSIENT_CODES.includes(e.code)) return true;
+  const msg = e?.message ?? '';
+  return TRANSIENT_HINTS.some((h) => msg.includes(h));
+};
+
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 /**
  * Client Prisma unique et partagé par toute l'application.
  *
- * Avant, chaque service instanciait son propre `PrismaClient` : ~10 pools de
- * connexions distincts vers Neon, ce qui amplifiait les erreurs `P1001`
- * (DatabaseNotReachable) lors des réveils de la base serverless.
- *
- * Ici : un seul pool `pg` réglé + reconnexion au démarrage + ping périodique
- * pour empêcher Neon de suspendre le compute pendant une démo.
+ * - un seul pool `pg` réglé (avant : ~10 pools, un par service)
+ * - reconnexion au démarrage
+ * - ping périodique pour empêcher Neon serverless de suspendre le compute
+ * - `retry()` pour rejouer une opération après une erreur transitoire
+ *   (base endormie, connexion coupée)
  */
 @Injectable()
 export class PrismaService
@@ -31,12 +42,11 @@ export class PrismaService
         connectionString: process.env.DATABASE_URL,
         max: 5,
         keepAlive: true,
-        connectionTimeoutMillis: 15_000,
-        idleTimeoutMillis: 30_000,
+        connectionTimeoutMillis: 20_000,
+        idleTimeoutMillis: 60_000,
       },
       {
         onPoolError: (error) => {
-          // Ne pas laisser une erreur de pool faire tomber le process.
           new Logger(PrismaService.name).warn(
             `Erreur du pool PostgreSQL : ${error.message}`,
           );
@@ -48,12 +58,9 @@ export class PrismaService
 
   async onModuleInit() {
     await this.connectWithRetry();
-    // Neon suspend le compute après ~5 min d'inactivité : on le garde chaud.
-    this.keepAliveTimer = setInterval(() => {
-      this.$queryRaw`SELECT 1`.catch((error) =>
-        this.logger.warn(`Ping keep-alive échoué : ${error.message}`),
-      );
-    }, 4 * 60 * 1000);
+    this.ping();
+    // Neon suspend le compute après ~5 min d'inactivité : ping toutes les 90 s.
+    this.keepAliveTimer = setInterval(() => this.ping(), 90_000);
     this.keepAliveTimer.unref?.();
   }
 
@@ -62,10 +69,39 @@ export class PrismaService
     await this.$disconnect().catch(() => undefined);
   }
 
-  private async connectWithRetry(tentatives = 5) {
+  private ping() {
+    this.$queryRaw`SELECT 1`.catch((error: Error) =>
+      this.logger.warn(`Ping keep-alive échoué : ${error.message}`),
+    );
+  }
+
+  /**
+   * Rejoue `fn` jusqu'à `tries` fois si l'erreur est transitoire
+   * (réveil de la base, connexion coupée). Sinon relance immédiatement.
+   */
+  async retry<T>(fn: () => Promise<T>, tries = 4): Promise<T> {
+    let lastError: unknown;
+    for (let i = 1; i <= tries; i++) {
+      try {
+        return await fn();
+      } catch (error) {
+        lastError = error;
+        if (!isTransient(error) || i === tries) throw error;
+        const delay = Math.min(500 * 2 ** (i - 1), 4000);
+        this.logger.warn(
+          `Requête rejouée (${i}/${tries - 1}) après erreur transitoire, dans ${delay} ms.`,
+        );
+        await wait(delay);
+      }
+    }
+    throw lastError;
+  }
+
+  private async connectWithRetry(tentatives = 6) {
     for (let i = 1; i <= tentatives; i++) {
       try {
         await this.$connect();
+        await this.$queryRaw`SELECT 1`;
         this.logger.log('Connexion à la base établie.');
         return;
       } catch (error: any) {
@@ -79,7 +115,7 @@ export class PrismaService
           );
           return;
         }
-        await new Promise((resolve) => setTimeout(resolve, attente));
+        await wait(attente);
       }
     }
   }

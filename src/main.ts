@@ -14,6 +14,15 @@ const isPortInUse = (port: number) => new Promise<boolean>((resolve) => {
     .listen(port, '::');
 });
 
+// Filet de sécurité : une promesse rejetée non gérée (ex. timeout Neon dans une
+// tâche planifiée) ne doit jamais arrêter le serveur.
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason instanceof Error ? reason.message : reason);
+});
+process.on('uncaughtException', (error) => {
+  console.error('[uncaughtException]', error.message);
+});
+
 async function bootstrap() {
   const port = Number(process.env.PORT ?? 3000);
   if (await isPortInUse(port)) {

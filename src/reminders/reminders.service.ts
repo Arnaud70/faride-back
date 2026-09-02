@@ -1,45 +1,51 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { Cron, CronExpression } from '@nestjs/schedule';
 import { NotificationsService } from '../notifications/notifications.service';
 import { PrismaService } from '../prisma/prisma.service';
 
 @Injectable()
 export class RemindersService {
-  private lastReminderCheck = new Date();
+  private readonly logger = new Logger(RemindersService.name);
 
   constructor(
     private notificationsService: NotificationsService,
     private prisma: PrismaService,
   ) {}
 
-  // Tâche planifiée : vérifier les rappels toutes les 5 minutes
+  // Tâche planifiée : vérifier les rappels toutes les 5 minutes.
+  // Une erreur transitoire (base Neon endormie) ne doit jamais faire tomber l'API.
   @Cron(CronExpression.EVERY_5_MINUTES)
   async checkAndCreateReminders() {
+    try {
+      return await this.runReminderCheck();
+    } catch (error) {
+      this.logger.warn(
+        `Vérification des rappels ignorée : ${(error as Error).message}`,
+      );
+      return { checked: 0, skipped: true };
+    }
+  }
+
+  private async runReminderCheck() {
     console.log('🔔 Vérification des rappels...');
 
     // Récupérer les commandes avec une heure de retrait dans les 30 prochaines minutes
     const now = new Date();
     const in30Minutes = new Date(now.getTime() + 30 * 60 * 1000);
 
-    const ordersNeedingReminder = await this.prisma.order.findMany({
-      where: {
-        heureRetrait: {
-          gte: now,
-          lte: in30Minutes,
+    const ordersNeedingReminder = await this.prisma.retry(() =>
+      this.prisma.order.findMany({
+        where: {
+          heureRetrait: { gte: now, lte: in30Minutes },
+          statut: { in: ['EN_ATTENTE', 'EN_PREPARATION'] },
+          reminder: null,
         },
-        statut: {
-          in: ['EN_ATTENTE', 'EN_PREPARATION'], // Pas besoin de rappeler pour PRETE
+        include: {
+          client: true,
+          items: { include: { dish: true } },
         },
-        // Vérifier qu'il n'y a pas déjà un rappel
-        reminder: null,
-      },
-      include: {
-        client: true,
-        items: {
-          include: { dish: true },
-        },
-      },
-    });
+      }),
+    );
 
     if (ordersNeedingReminder.length > 0) {
       console.log(`⏰ ${ordersNeedingReminder.length} commande(s) nécessitent un rappel`);
@@ -81,25 +87,24 @@ export class RemindersService {
   // Tâche planifiée : marquer les rappels comme envoyés si l'heure a passé
   @Cron(CronExpression.EVERY_MINUTE)
   async markRemindersAsSent() {
-    const now = new Date();
-
-    const sentReminders = await this.prisma.reminder.updateMany({
-      where: {
-        envoye: false,
-        heureDeclenchement: {
-          lte: now,
-        },
-      },
-      data: {
-        envoye: true,
-      },
-    });
-
-    if (sentReminders.count > 0) {
-      console.log(`✅ ${sentReminders.count} rappel(s) marqué(s) comme envoyé(s)`);
+    try {
+      const now = new Date();
+      const sentReminders = await this.prisma.retry(() =>
+        this.prisma.reminder.updateMany({
+          where: { envoye: false, heureDeclenchement: { lte: now } },
+          data: { envoye: true },
+        }),
+      );
+      if (sentReminders.count > 0) {
+        console.log(`✅ ${sentReminders.count} rappel(s) marqué(s) comme envoyé(s)`);
+      }
+      return sentReminders;
+    } catch (error) {
+      this.logger.warn(
+        `Mise à jour des rappels ignorée : ${(error as Error).message}`,
+      );
+      return { count: 0 };
     }
-
-    return sentReminders;
   }
 
   // Récupérer tous les rappels
