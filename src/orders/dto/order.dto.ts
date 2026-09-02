@@ -41,6 +41,13 @@ export class CreateOrderDto {
 }
 
 export class UpdateOrderStatusDto {
-  @IsEnum(['EN_ATTENTE', 'EN_PREPARATION', 'PRETE', 'LIVREE', 'RECUPEREE', 'ANNULEE'])
-  statut: 'EN_ATTENTE' | 'EN_PREPARATION' | 'PRETE' | 'LIVREE' | 'RECUPEREE' | 'ANNULEE';
+  @IsEnum(['EN_ATTENTE', 'EN_PREPARATION', 'PRETE', 'EN_ROUTE', 'LIVREE', 'RECUPEREE', 'ANNULEE'])
+  statut:
+    | 'EN_ATTENTE'
+    | 'EN_PREPARATION'
+    | 'PRETE'
+    | 'EN_ROUTE'
+    | 'LIVREE'
+    | 'RECUPEREE'
+    | 'ANNULEE';
 }

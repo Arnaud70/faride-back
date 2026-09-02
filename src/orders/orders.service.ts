@@ -14,6 +14,7 @@ const STATUT_LABELS: Record<string, string> = {
   EN_ATTENTE: 'en attente',
   EN_PREPARATION: 'en préparation',
   PRETE: 'prête',
+  EN_ROUTE: 'en route pour la livraison',
   LIVREE: 'en livraison',
   RECUPEREE: 'récupérée',
   ANNULEE: 'annulée',
@@ -35,8 +36,8 @@ const nextStatut = (
   const livraison: Record<string, string> = {
     EN_ATTENTE: 'EN_PREPARATION',
     EN_PREPARATION: 'PRETE',
-    PRETE: 'LIVREE',
-    LIVREE: 'RECUPEREE',
+    PRETE: 'EN_ROUTE',
+    EN_ROUTE: 'RECUPEREE',
   };
   const retrait: Record<string, string> = {
     EN_ATTENTE: 'EN_PREPARATION',
@@ -162,15 +163,7 @@ export class OrdersService {
   async findMyOrders(clientId: string) {
     return this.prisma.order.findMany({
       where: { clientId },
-      include: {
-        items: {
-          include: {
-            dish: true,
-          },
-        },
-        payment: true,
-        reminder: true,
-      },
+      include: ORDER_INCLUDE,
       orderBy: { createdAt: 'desc' },
     });
   }
@@ -178,17 +171,7 @@ export class OrdersService {
   async findAll(orderBy: 'heureRetrait' | 'createdAt' = 'heureRetrait', user?: any) {
     return this.prisma.order.findMany({
       where: user?.role === 'LIVREUR' ? { livreurId: user.id } : undefined,
-      include: {
-        items: {
-          include: {
-            dish: true,
-          },
-        },
-        client: true,
-        livreur: true,
-        payment: true,
-        reminder: true,
-      },
+      include: ORDER_INCLUDE,
       orderBy:
         orderBy === 'heureRetrait'
           ? { heureRetrait: 'asc' }
@@ -236,17 +219,19 @@ export class OrdersService {
 
     // Qui a le droit de faire CETTE transition précise ?
     const step = `${order.statut}->${target}`;
+    const estLivreurAssigne = role === 'LIVREUR' && order.livreurId === userId;
     const permission: Record<string, () => boolean> = {
       'EN_ATTENTE->EN_PREPARATION': () => ['CHEF', 'ADMIN'].includes(role),
       'EN_PREPARATION->PRETE': () => ['CHEF', 'ADMIN'].includes(role),
       // retrait : le personnel remet la commande au client
       'PRETE->RECUPEREE': () => ['CHEF', 'ADMIN'].includes(role),
-      // livraison : le livreur assigné (ou un admin) confirme la livraison
-      'PRETE->LIVREE': () =>
-        role === 'ADMIN' || (role === 'LIVREUR' && order.livreurId === userId),
-      // livraison : c'est le client qui confirme avoir récupéré sa commande
-      'LIVREE->RECUPEREE': () =>
-        role === 'ADMIN' || (role === 'CLIENT' && order.clientId === userId),
+      // livraison : le livreur assigné (ou un admin) démarre la livraison
+      'PRETE->EN_ROUTE': () => role === 'ADMIN' || estLivreurAssigne,
+      // livraison : le client confirme la réception, ou le livreur / l'admin la valide sur place
+      'EN_ROUTE->RECUPEREE': () =>
+        role === 'ADMIN' ||
+        estLivreurAssigne ||
+        (role === 'CLIENT' && order.clientId === userId),
     };
 
     if (!permission[step]?.()) {
@@ -254,9 +239,9 @@ export class OrdersService {
         "Vous n'êtes pas autorisé à effectuer ce changement de statut.",
       );
     }
-    if (step === 'PRETE->LIVREE' && !order.livreurId) {
+    if (step === 'PRETE->EN_ROUTE' && !order.livreurId) {
       throw new BadRequestException(
-        "Aucun livreur n'est assigné à cette commande.",
+        "Assignez d'abord un livreur à cette commande.",
       );
     }
 
@@ -269,8 +254,8 @@ export class OrdersService {
     const message =
       target === 'RECUPEREE'
         ? 'Votre commande a bien été récupérée. Merci !'
-        : target === 'LIVREE'
-          ? 'Votre commande est en cours de livraison.'
+        : target === 'EN_ROUTE'
+          ? `Votre commande est en route${updated.livreur ? ` avec ${updated.livreur.nom}` : ''}.`
           : `Votre commande est maintenant ${STATUT_LABELS[target] ?? target}.`;
     await this.notificationsService.notify(
       updated.clientId,
@@ -324,8 +309,8 @@ export class OrdersService {
             { code: 'EN_ATTENTE', label: 'Reçue' },
             { code: 'EN_PREPARATION', label: 'En préparation' },
             { code: 'PRETE', label: 'Prête' },
-            { code: 'LIVREE', label: 'En livraison' },
-            { code: 'RECUPEREE', label: 'Récupérée' },
+            { code: 'EN_ROUTE', label: 'En route' },
+            { code: 'RECUPEREE', label: 'Livrée' },
           ]
         : [
             { code: 'EN_ATTENTE', label: 'Reçue' },
@@ -339,10 +324,13 @@ export class OrdersService {
       EN_PREPARATION: 'Votre commande est en cours de préparation.',
       PRETE:
         order.orderType === 'LIVRAISON'
-          ? 'Votre commande est prête, un livreur va la prendre en charge.'
+          ? order.livreur
+            ? `Votre commande est prête. ${order.livreur.nom} va la livrer.`
+            : 'Votre commande est prête, un livreur va la prendre en charge.'
           : 'Votre commande est prête à être récupérée.',
-      LIVREE:
-        'Votre commande est en cours de livraison. Confirmez la réception une fois reçue.',
+      EN_ROUTE: order.livreur
+        ? `${order.livreur.nom} est en route pour vous livrer. Confirmez la réception une fois reçue.`
+        : 'Votre commande est en route. Confirmez la réception une fois reçue.',
     };
 
     return {
@@ -372,7 +360,7 @@ export class OrdersService {
   async cancel(id: string, role = 'ADMIN', userId?: string) {
     const order = await this.findOne(id);
 
-    if (['RECUPEREE', 'ANNULEE', 'LIVREE'].includes(order.statut)) {
+    if (['RECUPEREE', 'ANNULEE', 'EN_ROUTE', 'LIVREE'].includes(order.statut)) {
       throw new BadRequestException(
         'Cette commande ne peut plus être annulée.',
       );

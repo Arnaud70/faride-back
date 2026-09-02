@@ -63,6 +63,7 @@ export class PaymentsService {
     order: {
       include: {
         client: { select: { id: true, nom: true, telephone: true, email: true } },
+        livreur: { select: { id: true, nom: true, telephone: true } },
         items: { include: { dish: { select: { nom: true } } } },
       },
     },
