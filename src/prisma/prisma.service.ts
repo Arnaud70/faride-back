@@ -2,16 +2,30 @@ import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 
+/** Erreur levée quand la base reste injoignable malgré les tentatives. */
+export class DatabaseUnavailableError extends Error {
+  constructor(cause?: unknown) {
+    super('Base de données momentanément indisponible.');
+    this.name = 'DatabaseUnavailableError';
+    (this as { cause?: unknown }).cause = cause;
+  }
+}
+
 const TRANSIENT_CODES = ['P1001', 'P1002', 'P1008', 'P1017'];
 const TRANSIENT_HINTS = [
   'etimedout',
+  'timed out',
   'econnreset',
   'econnrefused',
+  'enotfound',
+  'eai_again',
+  'getaddrinfo',
   'epipe',
   'closed',
   'terminated',
   'not reachable',
   'not queryable',
+  "can't reach database server",
   'connection error',
   'connection terminated',
   'server closed the connection',
@@ -19,33 +33,79 @@ const TRANSIENT_HINTS = [
 ];
 
 export const isTransient = (error: unknown): boolean => {
-  const e = error as { code?: string; message?: string; name?: string };
+  const e = error as {
+    code?: string;
+    message?: string;
+    name?: string;
+    cause?: unknown;
+  };
   if (e?.code && TRANSIENT_CODES.includes(e.code)) return true;
+  if (e instanceof DatabaseUnavailableError) return true;
   const text = `${e?.name ?? ''} ${e?.message ?? ''}`.toLowerCase();
-  return TRANSIENT_HINTS.some((h) => text.includes(h));
+  if (TRANSIENT_HINTS.some((h) => text.includes(h))) return true;
+  // Prisma enveloppe souvent l'erreur réseau dans `cause` / `meta`.
+  const nested =
+    (e as { meta?: { driverAdapterError?: { cause?: { kind?: string } } } })?.meta
+      ?.driverAdapterError?.cause?.kind ?? '';
+  if (String(nested).toLowerCase().includes('notreachable')) return true;
+  return e?.cause ? isTransient(e.cause) : false;
 };
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
 const logger = new Logger('Prisma');
 
-/** Rejoue `fn` sur erreur transitoire (base Neon endormie / connexion coupée). */
-export async function retry<T>(fn: () => Promise<T>, tries = 6): Promise<T> {
-  const delays = [400, 900, 1800, 3500, 5000, 5000];
-  let last: unknown;
-  for (let i = 0; i < tries; i++) {
-    try {
-      return await fn();
-    } catch (error) {
-      last = error;
-      if (!isTransient(error) || i === tries - 1) throw error;
-      logger.warn(
-        `Requête rejouée (${i + 1}/${tries - 1}) après erreur transitoire, dans ${delays[i]} ms.`,
+/**
+ * Disjoncteur : après plusieurs échecs transitoires consécutifs (panne Neon),
+ * on arrête de retenter pendant un court moment et on répond vite 503, au lieu
+ * de laisser des dizaines de requêtes s'empiler en boucle de retry.
+ */
+const BREAKER_SEUIL = 6;
+const BREAKER_COOLDOWN_MS = 12_000;
+
+const breaker = {
+  failures: 0,
+  openUntil: 0,
+  get open() {
+    return Date.now() < this.openUntil;
+  },
+  recordSuccess() {
+    this.failures = 0;
+    this.openUntil = 0;
+  },
+  recordFailure() {
+    this.failures += 1;
+    if (this.failures >= BREAKER_SEUIL) {
+      this.openUntil = Date.now() + BREAKER_COOLDOWN_MS;
+      this.failures = 0;
+      logger.error(
+        `Base injoignable de façon répétée — pause des requêtes pendant ${BREAKER_COOLDOWN_MS / 1000}s.`,
       );
+    }
+  },
+};
+
+/** Rejoue `fn` sur erreur transitoire, avec disjoncteur. */
+export async function retry<T>(fn: () => Promise<T>): Promise<T> {
+  if (breaker.open) {
+    throw new DatabaseUnavailableError();
+  }
+
+  const delays = [300, 800, 1800]; // ~3 tentatives, ~3 s max
+  for (let i = 0; i <= delays.length; i++) {
+    try {
+      const result = await fn();
+      breaker.recordSuccess();
+      return result;
+    } catch (error) {
+      if (!isTransient(error)) throw error;
+      breaker.recordFailure();
+      if (breaker.open || i === delays.length) {
+        throw new DatabaseUnavailableError(error);
+      }
       await wait(delays[i]);
     }
   }
-  throw last;
+  throw new DatabaseUnavailableError();
 }
 
 /** Extension Prisma : chaque opération de modèle est automatiquement rejouée. */
@@ -67,7 +127,7 @@ export function createPrismaAdapter() {
       connectionString: process.env.DATABASE_URL,
       max: 5,
       keepAlive: true,
-      connectionTimeoutMillis: 20_000,
+      connectionTimeoutMillis: 15_000,
       idleTimeoutMillis: 60_000,
       allowExitOnIdle: false,
     },
@@ -77,32 +137,30 @@ export function createPrismaAdapter() {
   );
 }
 
-export async function connectWithRetry(client: PrismaClient, tries = 8) {
+export async function connectWithRetry(client: PrismaClient, tries = 30) {
   for (let i = 1; i <= tries; i++) {
     try {
       await client.$connect();
       await client.$queryRaw`SELECT 1`;
       logger.log('Connexion à la base établie.');
+      breaker.recordSuccess();
       return;
     } catch (error: any) {
-      const delay = Math.min(1000 * 2 ** (i - 1), 8000);
-      logger.warn(
-        `Base injoignable (${i}/${tries}) : ${error.message}. Nouvel essai dans ${delay} ms.`,
-      );
-      if (i === tries) {
-        logger.error(
-          "La base reste injoignable — l'API démarre quand même, les requêtes retenteront.",
+      const delay = Math.min(2000 * i, 15_000);
+      if (i <= 3 || i % 5 === 0) {
+        logger.warn(
+          `Base injoignable (essai ${i}) : ${error.message}. Nouvel essai dans ${delay / 1000}s.`,
         );
-        return;
       }
       await wait(delay);
     }
   }
+  logger.error('Base toujours injoignable après plusieurs minutes.');
 }
 
 /**
- * Type exposé par l'injection : un `PrismaClient` classique dont chaque
- * opération de modèle est protégée par un retry (voir `PrismaModule`).
+ * Client Prisma unique. `PrismaModule` fournit sa version étendue
+ * (chaque opération de modèle protégée par `retry` + disjoncteur).
  */
 @Injectable()
 export class PrismaService extends PrismaClient implements OnModuleDestroy {

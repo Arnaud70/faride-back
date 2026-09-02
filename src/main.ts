@@ -5,6 +5,7 @@ import { json, urlencoded } from 'express';
 import cookieParser from 'cookie-parser';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
+import { DbUnavailableFilter } from './common/db-unavailable.filter';
 
 // Filet de sécurité : une promesse rejetée non gérée (ex. timeout Neon dans une
 // tâche planifiée) ne doit jamais arrêter le serveur.
@@ -34,6 +35,9 @@ async function bootstrap() {
       transform: true,
     }),
   );
+
+  // Panne base -> 503 propre (au lieu de 500 / fuite de stack Prisma).
+  app.useGlobalFilters(new DbUnavailableFilter());
 
   const config = new DocumentBuilder()
     .setTitle("API Saveurs d'Ébène")

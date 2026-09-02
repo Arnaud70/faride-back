@@ -8,20 +8,21 @@ import {
 /**
  * Fournit un client Prisma unique et partagé.
  *
- * La fabrique :
- *  1. instancie le client (pool `pg` réglé),
- *  2. se connecte avec retry (Neon serverless peut être endormi),
- *  3. renvoie le client étendu : chaque `findMany` / `create` / … est
- *     automatiquement rejoué en cas d'erreur transitoire.
+ * La fabrique instancie le client et renvoie sa version étendue : chaque
+ * `findMany` / `create` / … est rejoué en cas d'erreur transitoire.
+ *
+ * La connexion initiale est lancée SANS être attendue : si Neon est en panne
+ * au démarrage, l'API se lève quand même immédiatement (les requêtes
+ * retenteront / répondront 503), au lieu de bloquer ~40 s.
  */
 @Global()
 @Module({
   providers: [
     {
       provide: PrismaService,
-      useFactory: async () => {
+      useFactory: () => {
         const base = new PrismaService();
-        await connectWithRetry(base);
+        void connectWithRetry(base);
         return base.$extends(retryExtension);
       },
     },

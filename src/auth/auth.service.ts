@@ -5,12 +5,25 @@ import { randomBytes } from 'crypto';
 import { RegisterDto, LoginDto } from './dto';
 import { PrismaService } from '../prisma/prisma.service';
 
+const USER_CACHE_TTL_MS = 60_000;
+
 @Injectable()
 export class AuthService {
+  /**
+   * Cache court des utilisateurs validés. `validateUser` est appelé sur CHAQUE
+   * requête authentifiée (JwtStrategy) : sans cache, c'est une requête DB par
+   * appel d'API, et pendant une panne Neon ça multiplie les erreurs.
+   */
+  private readonly userCache = new Map<string, { user: any; expiresAt: number }>();
+
   constructor(
     private jwtService: JwtService,
     private prisma: PrismaService,
   ) {}
+
+  private invalidateUser(userId: string) {
+    this.userCache.delete(userId);
+  }
 
   async register(registerDto: RegisterDto) {
     const { nom, telephone, email, motDePasse } = registerDto;
@@ -181,14 +194,24 @@ export class AuthService {
   }
 
   async validateUser(userId: string) {
+    const cached = this.userCache.get(userId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.user;
+    }
+
     const user = await this.prisma.user.findUnique({
       where: { id: userId },
     });
 
     if (!user || !user.actif) {
+      this.invalidateUser(userId);
       throw new UnauthorizedException('Utilisateur non trouvé');
     }
 
+    this.userCache.set(userId, {
+      user,
+      expiresAt: Date.now() + USER_CACHE_TTL_MS,
+    });
     return user;
   }
 }
