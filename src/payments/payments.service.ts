@@ -59,9 +59,19 @@ export class PaymentsService {
     };
   }
 
+  private readonly orderInclude = {
+    order: {
+      include: {
+        client: { select: { id: true, nom: true, telephone: true, email: true } },
+        items: { include: { dish: { select: { nom: true } } } },
+      },
+    },
+  };
+
   async findByOrderId(orderId: string) {
     const payment = await this.prisma.payment.findUnique({
       where: { orderId },
+      include: this.orderInclude,
     });
 
     if (!payment) {
@@ -73,9 +83,7 @@ export class PaymentsService {
 
   async findAll() {
     return this.prisma.payment.findMany({
-      include: {
-        order: true,
-      },
+      include: this.orderInclude,
       orderBy: { createdAt: 'desc' },
     });
   }

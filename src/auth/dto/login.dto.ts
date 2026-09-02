@@ -1,4 +1,6 @@
 import { IsEmail, IsOptional, IsString, MinLength } from 'class-validator';
+import { Transform } from 'class-transformer';
+import { normalizePhone } from './register.dto';
 
 export class LoginDto {
   @IsOptional()
@@ -6,6 +8,7 @@ export class LoginDto {
   email?: string;
 
   @IsOptional()
+  @Transform(({ value }) => (value ? normalizePhone(value) : value))
   @IsString()
   telephone?: string;
 

@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { createServer } from 'node:net';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
+import { json, urlencoded } from 'express';
 import cookieParser from 'cookie-parser';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
@@ -21,6 +22,11 @@ async function bootstrap() {
   }
 
   const app = await NestFactory.create(AppModule);
+
+  // Corps de requête plus large : les images de plats importées transitent
+  // en base64 (data URI) dans le JSON.
+  app.use(json({ limit: '6mb' }));
+  app.use(urlencoded({ extended: true, limit: '6mb' }));
 
   // Ajouter la validation globale
   app.useGlobalPipes(new ValidationPipe({

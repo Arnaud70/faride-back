@@ -7,13 +7,33 @@ import * as bcrypt from 'bcrypt';
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
 
+// Neon serverless peut être suspendu : on retente la connexion.
+async function connectWithRetry(tries = 6) {
+  for (let i = 1; i <= tries; i++) {
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      return;
+    } catch (error) {
+      if (i === tries) throw error;
+      console.log(`⏳ Base injoignable (${i}/${tries}), nouvelle tentative…`);
+      await new Promise((r) => setTimeout(r, Math.min(1500 * i, 6000)));
+    }
+  }
+}
+
 async function main() {
   console.log('🌱 Amorçage de la base de données...');
+  await connectWithRetry();
 
-  // Créer des utilisateurs de test
+  // Créer des utilisateurs de test — les mots de passe sont (re)forcés à chaque
+  // exécution du seed pour que les comptes de démo fonctionnent toujours.
   const adminUser = await prisma.user.upsert({
     where: { telephone: '+22892000001' },
-    update: {},
+    update: {
+      motDePasseHash: await bcrypt.hash('AdminPassword123', 10),
+      role: 'ADMIN',
+      actif: true,
+    },
     create: {
       nom: 'Admin Ébène',
       telephone: '+22892000001',
@@ -25,7 +45,11 @@ async function main() {
 
   const personnelUser = await prisma.user.upsert({
     where: { telephone: '+22892000002' },
-    update: {},
+    update: {
+      motDePasseHash: await bcrypt.hash('ChefPassword123', 10),
+      role: 'CHEF',
+      actif: true,
+    },
     create: {
       nom: 'Chef Cuisine',
       telephone: '+22892000002',
@@ -37,7 +61,11 @@ async function main() {
 
   const clientUser = await prisma.user.upsert({
     where: { telephone: '+22892000003' },
-    update: {},
+    update: {
+      motDePasseHash: await bcrypt.hash('ClientPassword123', 10),
+      role: 'CLIENT',
+      actif: true,
+    },
     create: {
       nom: 'Client Demo',
       telephone: '+22892000003',
