@@ -1,9 +1,4 @@
-import {
-  Injectable,
-  Logger,
-  OnModuleDestroy,
-  OnModuleInit,
-} from '@nestjs/common';
+import { Injectable, Logger, OnModuleDestroy } from '@nestjs/common';
 import { PrismaClient } from '@prisma/client';
 import { PrismaPg } from '@prisma/adapter-pg';
 
@@ -16,118 +11,106 @@ const TRANSIENT_HINTS = [
   'closed',
   'terminated',
   'not reachable',
-  'connection error',
   'not queryable',
+  'connection error',
+  'connection terminated',
   'server closed the connection',
+  'databasenotreachable',
 ];
 
-const isTransient = (error: unknown): boolean => {
-  const e = error as { code?: string; message?: string };
+export const isTransient = (error: unknown): boolean => {
+  const e = error as { code?: string; message?: string; name?: string };
   if (e?.code && TRANSIENT_CODES.includes(e.code)) return true;
-  const msg = (e?.message ?? '').toLowerCase();
-  return TRANSIENT_HINTS.some((h) => msg.includes(h));
+  const text = `${e?.name ?? ''} ${e?.message ?? ''}`.toLowerCase();
+  return TRANSIENT_HINTS.some((h) => text.includes(h));
 };
 
 const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+const logger = new Logger('Prisma');
+
+/** Rejoue `fn` sur erreur transitoire (base Neon endormie / connexion coupée). */
+export async function retry<T>(fn: () => Promise<T>, tries = 6): Promise<T> {
+  const delays = [400, 900, 1800, 3500, 5000, 5000];
+  let last: unknown;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      last = error;
+      if (!isTransient(error) || i === tries - 1) throw error;
+      logger.warn(
+        `Requête rejouée (${i + 1}/${tries - 1}) après erreur transitoire, dans ${delays[i]} ms.`,
+      );
+      await wait(delays[i]);
+    }
+  }
+  throw last;
+}
+
+/** Extension Prisma : chaque opération de modèle est automatiquement rejouée. */
+export const retryExtension = {
+  name: 'retry-on-transient',
+  query: {
+    $allModels: {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      async $allOperations({ args, query }: any) {
+        return retry(() => query(args));
+      },
+    },
+  },
+} as const;
+
+export function createPrismaAdapter() {
+  return new PrismaPg(
+    {
+      connectionString: process.env.DATABASE_URL,
+      max: 5,
+      keepAlive: true,
+      connectionTimeoutMillis: 20_000,
+      idleTimeoutMillis: 60_000,
+      allowExitOnIdle: false,
+    },
+    {
+      onPoolError: (error) => logger.warn(`Pool PostgreSQL : ${error.message}`),
+    },
+  );
+}
+
+export async function connectWithRetry(client: PrismaClient, tries = 8) {
+  for (let i = 1; i <= tries; i++) {
+    try {
+      await client.$connect();
+      await client.$queryRaw`SELECT 1`;
+      logger.log('Connexion à la base établie.');
+      return;
+    } catch (error: any) {
+      const delay = Math.min(1000 * 2 ** (i - 1), 8000);
+      logger.warn(
+        `Base injoignable (${i}/${tries}) : ${error.message}. Nouvel essai dans ${delay} ms.`,
+      );
+      if (i === tries) {
+        logger.error(
+          "La base reste injoignable — l'API démarre quand même, les requêtes retenteront.",
+        );
+        return;
+      }
+      await wait(delay);
+    }
+  }
+}
+
 /**
- * Client Prisma unique et partagé par toute l'application.
- *
- * - un seul pool `pg` réglé (avant : ~10 pools, un par service)
- * - reconnexion au démarrage
- * - ping périodique pour empêcher Neon serverless de suspendre le compute
- * - `retry()` pour rejouer une opération après une erreur transitoire
- *   (base endormie, connexion coupée)
+ * Type exposé par l'injection : un `PrismaClient` classique dont chaque
+ * opération de modèle est protégée par un retry (voir `PrismaModule`).
  */
 @Injectable()
-export class PrismaService
-  extends PrismaClient
-  implements OnModuleInit, OnModuleDestroy
-{
-  private readonly logger = new Logger(PrismaService.name);
-  private keepAliveTimer?: NodeJS.Timeout;
-
+export class PrismaService extends PrismaClient implements OnModuleDestroy {
   constructor() {
-    const adapter = new PrismaPg(
-      {
-        connectionString: process.env.DATABASE_URL,
-        max: 5,
-        keepAlive: true,
-        connectionTimeoutMillis: 20_000,
-        idleTimeoutMillis: 60_000,
-      },
-      {
-        onPoolError: (error) => {
-          new Logger(PrismaService.name).warn(
-            `Erreur du pool PostgreSQL : ${error.message}`,
-          );
-        },
-      },
-    );
-    super({ adapter });
-  }
-
-  async onModuleInit() {
-    await this.connectWithRetry();
-    this.ping();
-    // Neon suspend le compute après ~5 min d'inactivité : ping toutes les 90 s.
-    this.keepAliveTimer = setInterval(() => this.ping(), 90_000);
-    this.keepAliveTimer.unref?.();
+    super({ adapter: createPrismaAdapter() });
   }
 
   async onModuleDestroy() {
-    if (this.keepAliveTimer) clearInterval(this.keepAliveTimer);
     await this.$disconnect().catch(() => undefined);
-  }
-
-  private ping() {
-    this.$queryRaw`SELECT 1`.catch((error: Error) =>
-      this.logger.warn(`Ping keep-alive échoué : ${error.message}`),
-    );
-  }
-
-  /**
-   * Rejoue `fn` jusqu'à `tries` fois si l'erreur est transitoire
-   * (réveil de la base, connexion coupée). Sinon relance immédiatement.
-   */
-  async retry<T>(fn: () => Promise<T>, tries = 4): Promise<T> {
-    let lastError: unknown;
-    for (let i = 1; i <= tries; i++) {
-      try {
-        return await fn();
-      } catch (error) {
-        lastError = error;
-        if (!isTransient(error) || i === tries) throw error;
-        const delay = Math.min(500 * 2 ** (i - 1), 4000);
-        this.logger.warn(
-          `Requête rejouée (${i}/${tries - 1}) après erreur transitoire, dans ${delay} ms.`,
-        );
-        await wait(delay);
-      }
-    }
-    throw lastError;
-  }
-
-  private async connectWithRetry(tentatives = 6) {
-    for (let i = 1; i <= tentatives; i++) {
-      try {
-        await this.$connect();
-        await this.$queryRaw`SELECT 1`;
-        this.logger.log('Connexion à la base établie.');
-        return;
-      } catch (error: any) {
-        const attente = Math.min(1000 * 2 ** (i - 1), 8000);
-        this.logger.warn(
-          `Base injoignable (tentative ${i}/${tentatives}) : ${error.message}. Nouvel essai dans ${attente} ms.`,
-        );
-        if (i === tentatives) {
-          this.logger.error(
-            "Impossible de joindre la base au démarrage — l'API démarre quand même, les requêtes retenteront.",
-          );
-          return;
-        }
-        await wait(attente);
-      }
-    }
   }
 }

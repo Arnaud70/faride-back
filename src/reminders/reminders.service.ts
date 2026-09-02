@@ -33,19 +33,17 @@ export class RemindersService {
     const now = new Date();
     const in30Minutes = new Date(now.getTime() + 30 * 60 * 1000);
 
-    const ordersNeedingReminder = await this.prisma.retry(() =>
-      this.prisma.order.findMany({
-        where: {
-          heureRetrait: { gte: now, lte: in30Minutes },
-          statut: { in: ['EN_ATTENTE', 'EN_PREPARATION'] },
-          reminder: null,
-        },
-        include: {
-          client: true,
-          items: { include: { dish: true } },
-        },
-      }),
-    );
+    const ordersNeedingReminder = await this.prisma.order.findMany({
+      where: {
+        heureRetrait: { gte: now, lte: in30Minutes },
+        statut: { in: ['EN_ATTENTE', 'EN_PREPARATION'] },
+        reminder: null,
+      },
+      include: {
+        client: true,
+        items: { include: { dish: true } },
+      },
+    });
 
     if (ordersNeedingReminder.length > 0) {
       console.log(`⏰ ${ordersNeedingReminder.length} commande(s) nécessitent un rappel`);
@@ -89,12 +87,10 @@ export class RemindersService {
   async markRemindersAsSent() {
     try {
       const now = new Date();
-      const sentReminders = await this.prisma.retry(() =>
-        this.prisma.reminder.updateMany({
-          where: { envoye: false, heureDeclenchement: { lte: now } },
-          data: { envoye: true },
-        }),
-      );
+      const sentReminders = await this.prisma.reminder.updateMany({
+        where: { envoye: false, heureDeclenchement: { lte: now } },
+        data: { envoye: true },
+      });
       if (sentReminders.count > 0) {
         console.log(`✅ ${sentReminders.count} rappel(s) marqué(s) comme envoyé(s)`);
       }
