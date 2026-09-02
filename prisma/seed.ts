@@ -7,23 +7,44 @@ import * as bcrypt from 'bcrypt';
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL });
 const prisma = new PrismaClient({ adapter });
 
-// Neon serverless peut être suspendu : on retente la connexion.
-async function connectWithRetry(tries = 6) {
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+const isTransient = (error: any) => {
+  const code = error?.code;
+  const msg = String(error?.message ?? '');
+  return (
+    ['P1001', 'P1002', 'P1008', 'P1017'].includes(code) ||
+    ['ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'Closed', 'terminated', 'not reachable'].some((h) =>
+      msg.includes(h),
+    )
+  );
+};
+
+/**
+ * Rejoue `fn` sur erreur transitoire. Le seed n'utilisant que des `upsert`
+ * idempotents, on peut relancer tout le bloc sans risque de doublon.
+ */
+async function withRetry<T>(label: string, fn: () => Promise<T>, tries = 6): Promise<T> {
   for (let i = 1; i <= tries; i++) {
     try {
-      await prisma.$queryRaw`SELECT 1`;
-      return;
+      return await fn();
     } catch (error) {
-      if (i === tries) throw error;
-      console.log(`⏳ Base injoignable (${i}/${tries}), nouvelle tentative…`);
-      await new Promise((r) => setTimeout(r, Math.min(1500 * i, 6000)));
+      if (i === tries || !isTransient(error)) throw error;
+      const delay = Math.min(2000 * i, 8000);
+      console.log(`⏳ ${label} : base endormie (${i}/${tries - 1}), nouvel essai dans ${delay} ms…`);
+      await sleep(delay);
     }
   }
+  throw new Error('unreachable');
 }
 
 async function main() {
   console.log('🌱 Amorçage de la base de données...');
-  await connectWithRetry();
+  await withRetry('connexion', () => prisma.$queryRaw`SELECT 1`);
+  await withRetry('amorçage', seed);
+}
+
+async function seed() {
 
   // Créer des utilisateurs de test — les mots de passe sont (re)forcés à chaque
   // exécution du seed pour que les comptes de démo fonctionnent toujours.
@@ -75,65 +96,33 @@ async function main() {
     },
   });
 
-  const livreurs = await Promise.all([
-    prisma.user.upsert({
-      where: { telephone: '+22892000004' },
-      update: { role: 'LIVREUR', actif: true },
-      create: {
-        nom: 'Livreur Test 1',
-        telephone: '+22892000004',
-        email: 'livreur1@saveursebene.tg',
-        motDePasseHash: await bcrypt.hash('LivreurPassword123', 10),
-        role: 'LIVREUR',
-      },
-    }),
-    prisma.user.upsert({
-      where: { telephone: '+22892000005' },
-      update: { role: 'LIVREUR', actif: true },
-      create: {
-        nom: 'Livreur Test 2',
-        telephone: '+22892000005',
-        email: 'livreur2@saveursebene.tg',
-        motDePasseHash: await bcrypt.hash('LivreurPassword123', 10),
-        role: 'LIVREUR',
-      },
-    }),
-    prisma.user.upsert({
-      where: { telephone: '+22892000006' },
-      update: { role: 'LIVREUR', actif: true },
-      create: {
-        nom: 'Livreur Test 3',
-        telephone: '+22892000006',
-        email: 'livreur3@saveursebene.tg',
-        motDePasseHash: await bcrypt.hash('LivreurPassword123', 10),
-        role: 'LIVREUR',
-      },
-    }),
-  ]);
+  // Séquentiel (pas de Promise.all) : moins de pression sur une base Neon
+  // qui vient de se réveiller.
+  const livreurHash = await bcrypt.hash('LivreurPassword123', 10);
+  const livreurs: Array<Awaited<ReturnType<typeof prisma.user.upsert>>> = [];
+  for (const [index, telephone] of ['+22892000004', '+22892000005', '+22892000006'].entries()) {
+    livreurs.push(
+      await prisma.user.upsert({
+        where: { telephone },
+        update: { role: 'LIVREUR', actif: true },
+        create: {
+          nom: `Livreur Test ${index + 1}`,
+          telephone,
+          email: `livreur${index + 1}@saveursebene.tg`,
+          motDePasseHash: livreurHash,
+          role: 'LIVREUR',
+        },
+      }),
+    );
+  }
 
   // Créer les catégories de menu
-  const categories = await Promise.all([
-    prisma.category.upsert({
-      where: { nom: 'Plats Principaux' },
-      update: {},
-      create: { nom: 'Plats Principaux' },
-    }),
-    prisma.category.upsert({
-      where: { nom: 'Pizzas' },
-      update: {},
-      create: { nom: 'Pizzas' },
-    }),
-    prisma.category.upsert({
-      where: { nom: 'Sandwichs & Burgers' },
-      update: {},
-      create: { nom: 'Sandwichs & Burgers' },
-    }),
-    prisma.category.upsert({
-      where: { nom: 'Boissons' },
-      update: {},
-      create: { nom: 'Boissons' },
-    }),
-  ]);
+  const categories: Array<Awaited<ReturnType<typeof prisma.category.upsert>>> = [];
+  for (const nom of ['Plats Principaux', 'Pizzas', 'Sandwichs & Burgers', 'Boissons']) {
+    categories.push(
+      await prisma.category.upsert({ where: { nom }, update: {}, create: { nom } }),
+    );
+  }
 
   // Créer des plats de démonstration
   const plaitsChef: Array<any> = [
