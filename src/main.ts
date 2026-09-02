@@ -1,18 +1,10 @@
 import 'dotenv/config';
-import { createServer } from 'node:net';
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe } from '@nestjs/common';
 import { json, urlencoded } from 'express';
 import cookieParser from 'cookie-parser';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { AppModule } from './app.module';
-
-const isPortInUse = (port: number) => new Promise<boolean>((resolve) => {
-  const probe = createServer()
-    .once('error', (error: NodeJS.ErrnoException) => resolve(error.code === 'EADDRINUSE'))
-    .once('listening', () => probe.close(() => resolve(false)))
-    .listen(port, '::');
-});
 
 // Filet de sécurité : une promesse rejetée non gérée (ex. timeout Neon dans une
 // tâche planifiée) ne doit jamais arrêter le serveur.
@@ -23,12 +15,10 @@ process.on('uncaughtException', (error) => {
   console.error('[uncaughtException]', error.message);
 });
 
+const wait = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 async function bootstrap() {
   const port = Number(process.env.PORT ?? 3000);
-  if (await isPortInUse(port)) {
-    console.log(`Le port ${port} est déjà utilisé. L'API existante est conservée.`);
-    return;
-  }
 
   const app = await NestFactory.create(AppModule);
 
@@ -37,23 +27,23 @@ async function bootstrap() {
   app.use(json({ limit: '6mb' }));
   app.use(urlencoded({ extended: true, limit: '6mb' }));
 
-  // Ajouter la validation globale
-  app.useGlobalPipes(new ValidationPipe({
-    whitelist: true,
-    forbidNonWhitelisted: true,
-    transform: true,
-  }));
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+    }),
+  );
 
-  // Configurer Swagger
   const config = new DocumentBuilder()
-    .setTitle('API Saveurs d\'Ébène')
-    .setDescription('Plateforme de gestion des commandes pour le restaurant Saveurs d\'Ébène')
+    .setTitle("API Saveurs d'Ébène")
+    .setDescription(
+      "Plateforme de gestion des commandes pour le restaurant Saveurs d'Ébène",
+    )
     .setVersion('1.0')
     .addBearerAuth()
     .build();
-  
-  const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('api/docs', app, document);
+  SwaggerModule.setup('api/docs', app, SwaggerModule.createDocument(app, config));
 
   app.use(cookieParser());
   app.enableCors({
@@ -61,17 +51,31 @@ async function bootstrap() {
     credentials: true,
   });
 
-  try {
-    await app.listen(port);
-  } catch (error: any) {
-    if (error?.code === 'EADDRINUSE') {
-      await app.close();
-      console.log(`Le port ${port} est déjà utilisé. L'API existante est conservée.`);
+  // Sur un redémarrage à chaud, l'ancien process peut encore tenir le port
+  // pendant ~1 s : on retente au lieu d'abandonner (c'était la cause du
+  // "serveur qui se coupe tout seul").
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    try {
+      await app.listen(port);
+      console.log(`Application en écoute sur le port ${port}`);
+      console.log(
+        `Documentation Swagger disponible à http://localhost:${port}/api/docs`,
+      );
       return;
+    } catch (error: any) {
+      if (error?.code === 'EADDRINUSE' && attempt < 8) {
+        console.log(
+          `Port ${port} occupé (tentative ${attempt}/8), nouvel essai dans 1 s…`,
+        );
+        await wait(1000);
+        continue;
+      }
+      throw error;
     }
-    throw error;
   }
-  console.log(`Application en écoute sur le port ${port}`);
-  console.log(`Documentation Swagger disponible à http://localhost:${port}/api/docs`);
 }
-bootstrap();
+
+bootstrap().catch((error) => {
+  console.error("Échec du démarrage de l'API :", error?.message ?? error);
+  process.exit(1);
+});

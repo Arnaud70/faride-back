@@ -1,4 +1,9 @@
-import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import {
+  Injectable,
+  NotFoundException,
+  BadRequestException,
+  ForbiddenException,
+} from '@nestjs/common';
 import { Decimal } from 'decimal.js';
 import { CreateOrderDto, UpdateOrderStatusDto } from './dto/order.dto';
 import { SettingsService } from '../settings/settings.service';
@@ -12,6 +17,33 @@ const STATUT_LABELS: Record<string, string> = {
   LIVREE: 'en livraison',
   RECUPEREE: 'récupérée',
   ANNULEE: 'annulée',
+};
+
+const ORDER_INCLUDE = {
+  items: { include: { dish: true } },
+  client: true,
+  livreur: true,
+  payment: true,
+  reminder: true,
+} as const;
+
+/** Étape suivante autorisée selon le type de commande. */
+const nextStatut = (
+  orderType: string,
+  current: string,
+): string | undefined => {
+  const livraison: Record<string, string> = {
+    EN_ATTENTE: 'EN_PREPARATION',
+    EN_PREPARATION: 'PRETE',
+    PRETE: 'LIVREE',
+    LIVREE: 'RECUPEREE',
+  };
+  const retrait: Record<string, string> = {
+    EN_ATTENTE: 'EN_PREPARATION',
+    EN_PREPARATION: 'PRETE',
+    PRETE: 'RECUPEREE',
+  };
+  return (orderType === 'LIVRAISON' ? livraison : retrait)[current];
 };
 
 @Injectable()
@@ -167,16 +199,7 @@ export class OrdersService {
   async findOne(id: string) {
     const order = await this.prisma.order.findUnique({
       where: { id },
-      include: {
-        items: {
-          include: {
-            dish: true,
-          },
-        },
-        client: true,
-        payment: true,
-        reminder: true,
-      },
+      include: ORDER_INCLUDE,
     });
 
     if (!order) {
@@ -186,51 +209,73 @@ export class OrdersService {
     return order;
   }
 
-  async updateStatus(id: string, updateStatusDto: UpdateOrderStatusDto, role: string, userId?: string) {
+  async updateStatus(
+    id: string,
+    updateStatusDto: UpdateOrderStatusDto,
+    role: string,
+    userId?: string,
+  ) {
     const order = await this.findOne(id);
+    const target = updateStatusDto.statut;
 
-    const transitions: Record<string, string[]> = {
-      EN_ATTENTE: ['EN_PREPARATION'],
-      EN_PREPARATION: ['PRETE'],
-      PRETE: ['LIVREE'],
-      LIVREE: ['RECUPEREE'],
-    };
-    const allowed = transitions[order.statut] || [];
-    if (role === 'LIVREUR' && (!order.livreurId || order.livreurId !== userId || !['LIVREE', 'RECUPEREE'].includes(updateStatusDto.statut))) {
-      throw new BadRequestException('Ce livreur ne peut pas modifier cette commande');
+    if (target === 'ANNULEE') {
+      return this.cancel(id, role, userId);
     }
-    if (role === 'CHEF' && updateStatusDto.statut === 'ANNULEE') {
-      return this.cancel(id);
+
+    if (['RECUPEREE', 'ANNULEE'].includes(order.statut)) {
+      throw new BadRequestException('Cette commande est déjà terminée.');
     }
-    if (!['ADMIN', 'CHEF'].includes(role) && role !== 'LIVREUR' && !allowed.includes(updateStatusDto.statut)) {
+
+    // La seule progression possible dépend du type de commande (retrait / livraison).
+    const expected = nextStatut(order.orderType, order.statut);
+    if (target !== expected) {
       throw new BadRequestException(
-        `Transition impossible : ${order.statut} vers ${updateStatusDto.statut}`,
+        `Transition impossible : ${STATUT_LABELS[order.statut]} → ${STATUT_LABELS[target] ?? target}.`,
       );
     }
-    if (['ADMIN', 'CHEF'].includes(role) && updateStatusDto.statut === 'ANNULEE' && order.statut === 'RECUPEREE') {
-      throw new BadRequestException('Une commande récupérée ne peut pas être annulée');
+
+    // Qui a le droit de faire CETTE transition précise ?
+    const step = `${order.statut}->${target}`;
+    const permission: Record<string, () => boolean> = {
+      'EN_ATTENTE->EN_PREPARATION': () => ['CHEF', 'ADMIN'].includes(role),
+      'EN_PREPARATION->PRETE': () => ['CHEF', 'ADMIN'].includes(role),
+      // retrait : le personnel remet la commande au client
+      'PRETE->RECUPEREE': () => ['CHEF', 'ADMIN'].includes(role),
+      // livraison : le livreur assigné (ou un admin) confirme la livraison
+      'PRETE->LIVREE': () =>
+        role === 'ADMIN' || (role === 'LIVREUR' && order.livreurId === userId),
+      // livraison : c'est le client qui confirme avoir récupéré sa commande
+      'LIVREE->RECUPEREE': () =>
+        role === 'ADMIN' || (role === 'CLIENT' && order.clientId === userId),
+    };
+
+    if (!permission[step]?.()) {
+      throw new ForbiddenException(
+        "Vous n'êtes pas autorisé à effectuer ce changement de statut.",
+      );
+    }
+    if (step === 'PRETE->LIVREE' && !order.livreurId) {
+      throw new BadRequestException(
+        "Aucun livreur n'est assigné à cette commande.",
+      );
     }
 
     const updated = await this.prisma.order.update({
       where: { id },
-      data: { statut: updateStatusDto.statut },
-      include: {
-        items: {
-          include: {
-            dish: true,
-          },
-        },
-        client: true,
-        livreur: true,
-        payment: true,
-        reminder: true,
-      },
+      data: { statut: target },
+      include: ORDER_INCLUDE,
     });
 
+    const message =
+      target === 'RECUPEREE'
+        ? 'Votre commande a bien été récupérée. Merci !'
+        : target === 'LIVREE'
+          ? 'Votre commande est en cours de livraison.'
+          : `Votre commande est maintenant ${STATUT_LABELS[target] ?? target}.`;
     await this.notificationsService.notify(
       updated.clientId,
       `Commande ${updated.orderNumber}`,
-      `Votre commande est maintenant ${STATUT_LABELS[updated.statut] ?? updated.statut}.`,
+      message,
       'COMMANDE',
     );
 
@@ -245,14 +290,26 @@ export class OrdersService {
     if (!livreur || livreur.role !== 'LIVREUR' || !livreur.actif) {
       throw new BadRequestException('Livreur actif introuvable');
     }
+    if (order.orderType !== 'LIVRAISON') {
+      throw new BadRequestException(
+        "Cette commande n'est pas une commande à livrer.",
+      );
+    }
     if (order.statut !== 'PRETE') {
       throw new BadRequestException('La commande doit être prête avant sa livraison');
     }
-    return this.prisma.order.update({
+    const updated = await this.prisma.order.update({
       where: { id },
       data: { livreurId },
-      include: { items: { include: { dish: true } }, client: true, livreur: true, payment: true },
+      include: ORDER_INCLUDE,
     });
+    await this.notificationsService.notify(
+      updated.clientId,
+      `Commande ${updated.orderNumber}`,
+      `Un livreur (${livreur.nom}) a été assigné à votre commande.`,
+      'COMMANDE',
+    );
+    return updated;
   }
 
   async findTracking(id: string, clientId: string) {
@@ -261,64 +318,93 @@ export class OrdersService {
       throw new NotFoundException('Commande non trouvée');
     }
 
-    const stages = [
-      { code: 'EN_ATTENTE', label: 'Reçue' },
-      { code: 'EN_PREPARATION', label: 'En préparation' },
-      { code: 'PRETE', label: 'Prête' },
-      { code: 'RECUPEREE', label: 'Récupérée' },
-    ];
+    const stages =
+      order.orderType === 'LIVRAISON'
+        ? [
+            { code: 'EN_ATTENTE', label: 'Reçue' },
+            { code: 'EN_PREPARATION', label: 'En préparation' },
+            { code: 'PRETE', label: 'Prête' },
+            { code: 'LIVREE', label: 'En livraison' },
+            { code: 'RECUPEREE', label: 'Récupérée' },
+          ]
+        : [
+            { code: 'EN_ATTENTE', label: 'Reçue' },
+            { code: 'EN_PREPARATION', label: 'En préparation' },
+            { code: 'PRETE', label: 'Prête' },
+            { code: 'RECUPEREE', label: 'Récupérée' },
+          ];
     const currentIndex = stages.findIndex((stage) => stage.code === order.statut);
+
+    const messages: Record<string, string> = {
+      EN_PREPARATION: 'Votre commande est en cours de préparation.',
+      PRETE:
+        order.orderType === 'LIVRAISON'
+          ? 'Votre commande est prête, un livreur va la prendre en charge.'
+          : 'Votre commande est prête à être récupérée.',
+      LIVREE:
+        'Votre commande est en cours de livraison. Confirmez la réception une fois reçue.',
+    };
 
     return {
       id: order.id,
       orderNumber: order.orderNumber,
       statut: order.statut,
+      orderType: order.orderType,
       heureRetrait: order.heureRetrait,
       montantTotal: order.montantTotal,
       client: order.client,
+      livreur: order.livreur ?? null,
       items: order.items,
       timeline: stages.map((stage, index) => ({
         ...stage,
         termine: currentIndex >= index,
         actuel: currentIndex === index,
       })),
-      message: order.statut === 'PRETE'
-        ? 'Votre commande est prête à être récupérée.'
-        : order.statut === 'EN_PREPARATION'
-          ? 'Votre commande est en cours de préparation.'
-          : null,
+      message: messages[order.statut] ?? null,
     };
   }
 
-  async cancel(id: string) {
+  /**
+   * Annulation.
+   * - Client : uniquement tant que la commande est EN_ATTENTE (avant préparation).
+   * - Chef / Admin : à tout moment sauf commande déjà récupérée ou annulée.
+   */
+  async cancel(id: string, role = 'ADMIN', userId?: string) {
     const order = await this.findOne(id);
 
-    // Vérifier si la commande peut être annulée
-    if (order.statut === 'RECUPEREE' || order.statut === 'ANNULEE') {
+    if (['RECUPEREE', 'ANNULEE', 'LIVREE'].includes(order.statut)) {
       throw new BadRequestException(
-        `Impossible d'annuler une commande avec le statut ${order.statut}`,
+        'Cette commande ne peut plus être annulée.',
+      );
+    }
+
+    if (role === 'CLIENT') {
+      if (order.clientId !== userId) {
+        throw new ForbiddenException('Accès refusé.');
+      }
+      if (order.statut !== 'EN_ATTENTE') {
+        throw new BadRequestException(
+          "Trop tard : votre commande est déjà en préparation. Contactez le restaurant pour l'annuler.",
+        );
+      }
+    } else if (!['CHEF', 'ADMIN'].includes(role)) {
+      throw new ForbiddenException(
+        "Vous n'êtes pas autorisé à annuler cette commande.",
       );
     }
 
     const updated = await this.prisma.order.update({
       where: { id },
       data: { statut: 'ANNULEE' },
-      include: {
-        items: {
-          include: {
-            dish: true,
-          },
-        },
-        client: true,
-        payment: true,
-        reminder: true,
-      },
+      include: ORDER_INCLUDE,
     });
 
     await this.notificationsService.notify(
       updated.clientId,
       `Commande ${updated.orderNumber}`,
-      'Votre commande a été annulée.',
+      role === 'CLIENT'
+        ? 'Votre commande a bien été annulée.'
+        : 'Votre commande a été annulée par le restaurant.',
       'COMMANDE',
     );
 

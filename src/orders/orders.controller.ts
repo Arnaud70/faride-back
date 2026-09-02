@@ -94,12 +94,16 @@ export class OrdersController {
 
   @Patch(':id/status')
   @UseGuards(JwtAuthGuard, RoleGuard)
-  @Roles('ADMIN', 'CHEF', 'LIVREUR')
+  @Roles('ADMIN', 'CHEF', 'LIVREUR', 'CLIENT')
   @ApiBearerAuth()
-  @ApiOperation({ summary: 'Mettre à jour le statut d\'une commande (Admin/Personnel)' })
+  @ApiOperation({
+    summary:
+      "Faire progresser le statut d'une commande (personnel, livreur assigné, ou client pour confirmer la réception)",
+  })
   @ApiResponse({ status: 200, description: 'Statut mis à jour' })
-  @ApiResponse({ status: 404, description: 'Commande non trouvée' })
+  @ApiResponse({ status: 400, description: 'Transition impossible' })
   @ApiResponse({ status: 403, description: 'Accès refusé' })
+  @ApiResponse({ status: 404, description: 'Commande non trouvée' })
   async updateStatus(
     @Param('id') id: string,
     @Body() updateStatusDto: UpdateOrderStatusDto,
@@ -117,13 +121,6 @@ export class OrdersController {
   @ApiResponse({ status: 404, description: 'Commande non trouvée' })
   @ApiResponse({ status: 401, description: 'Non authentifié' })
   async cancel(@Param('id') id: string, @CurrentUser() user: any) {
-    const order = await this.ordersService.findOne(id);
-    if (user.role === 'CLIENT' && order.clientId !== user.id) {
-      throw new ForbiddenException('Accès refusé');
-    }
-    if (!['CLIENT', 'ADMIN', 'CHEF'].includes(user.role)) {
-      throw new ForbiddenException('Seul le client, le chef ou l\'administrateur peut annuler une commande');
-    }
-    return this.ordersService.cancel(id);
+    return this.ordersService.cancel(id, user.role, user.id);
   }
 }
