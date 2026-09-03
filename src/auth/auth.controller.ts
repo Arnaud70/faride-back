@@ -67,10 +67,15 @@ export class AuthController {
   }
 
   private cookieOptions() {
+    // En prod, frontend (Vercel) et backend (Render) sont sur des domaines
+    // différents : un cookie "lax" n'est jamais envoyé sur un fetch/XHR
+    // cross-site, seulement "none" (qui exige secure: true). En dev, les deux
+    // tournent sur localhost -> "lax" suffit et évite secure sur http.
+    const isProd = process.env.NODE_ENV === 'production';
     return {
       httpOnly: true,
-      secure: process.env.NODE_ENV === 'production',
-      sameSite: 'lax' as const,
+      secure: isProd,
+      sameSite: (isProd ? 'none' : 'lax') as 'none' | 'lax',
       maxAge: 7 * 24 * 60 * 60 * 1000,
       path: '/auth',
     };

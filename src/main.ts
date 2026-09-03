@@ -50,8 +50,33 @@ async function bootstrap() {
   SwaggerModule.setup('api/docs', app, SwaggerModule.createDocument(app, config));
 
   app.use(cookieParser());
+
+  // Origines autorisées : localhost en dev + celles listées dans CORS_ORIGINS
+  // (séparées par des virgules, ex. "https://faride-front.vercel.app"), plus
+  // tout déploiement preview Vercel du même projet (*.vercel.app).
+  const extraOrigins = (process.env.CORS_ORIGINS ?? '')
+    .split(',')
+    .map((o) => o.trim())
+    .filter(Boolean);
+  const staticOrigins = [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+    ...extraOrigins,
+  ];
   app.enableCors({
-    origin: ['http://localhost:5173', 'http://127.0.0.1:5173'],
+    origin: (origin, callback) => {
+      if (!origin || staticOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+      try {
+        if (/\.vercel\.app$/.test(new URL(origin).hostname)) {
+          return callback(null, true);
+        }
+      } catch {
+        // origin malformé -> refusé ci-dessous
+      }
+      callback(new Error(`Origine non autorisée par CORS : ${origin}`), false);
+    },
     credentials: true,
   });
 
